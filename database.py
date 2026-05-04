@@ -4,6 +4,7 @@
 import os
 import sqlite3
 import json
+import time
 from typing import Optional, Dict, List, Tuple
 from dataclasses import dataclass, asdict
 from datetime import datetime
@@ -37,7 +38,7 @@ class Contact:
     last_seen: float
     last_ip: str
     last_port: int
-    signature: bytes = b''   # подпись владельца
+    signature: bytes = b''
 
     def to_dict(self):
         d = asdict(self)
@@ -99,19 +100,17 @@ class Database:
                 unread_count INTEGER DEFAULT 0
             )
         ''')
-        # Таблица для хранения чужих offline-сообщений (ретрансляция)
         cur.execute('''
             CREATE TABLE IF NOT EXISTS stored_messages (
                 msg_id TEXT PRIMARY KEY,
                 recipient_node_id TEXT,
                 encrypted_blob BLOB,
                 timestamp REAL,
-                ttl REAL DEFAULT 172800  -- 48 часов
+                ttl REAL DEFAULT 172800
             )
         ''')
         self.conn.commit()
 
-    # Методы для пользователя
     def save_user(self, username, pwd_hash, mnem_enc, priv, pub):
         cur = self.conn.cursor()
         cur.execute('INSERT OR REPLACE INTO user VALUES (?,?,?,?,?)',
@@ -124,7 +123,6 @@ class Database:
         row = cur.fetchone()
         return dict(row) if row else None
 
-    # Контакты
     def save_contact(self, contact: Contact):
         cur = self.conn.cursor()
         cur.execute('''
@@ -170,7 +168,6 @@ class Database:
             ))
         return contacts
 
-    # Сообщения
     def save_message(self, msg: Message):
         cur = self.conn.cursor()
         cur.execute('''
@@ -222,7 +219,6 @@ class Database:
         row = cur.fetchone()
         return row[0] if row else None
 
-    # Хранение чужих сообщений (ретрансляция)
     def store_offline_message(self, msg_id: str, recipient_node_id: bytes, encrypted_blob: bytes, timestamp: float):
         cur = self.conn.cursor()
         cur.execute('''
@@ -244,4 +240,12 @@ class Database:
         cur = self.conn.cursor()
         cur.execute('DELETE FROM stored_messages WHERE msg_id = ?', (msg_id,))
         self.conn.commit()
+
+    def ensure_chat(self, username: str):
+        """Создаёт запись в таблице chats, если её ещё нет."""
+        cur = self.conn.cursor()
+        cur.execute('''
+            INSERT OR IGNORE INTO chats (contact_username, last_message_time, unread_count)
+            VALUES (?, ?, 0)
+        ''', (username, time.time()))
         self.conn.commit()
