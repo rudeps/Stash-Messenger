@@ -1,6 +1,3 @@
-"""
-P2P-сеть с элементами DHT, репликацией контактов и хранением offline-сообщений.
-"""
 import os
 import sys
 import json
@@ -12,13 +9,12 @@ import random
 import math
 from typing import Dict, List, Tuple, Optional, Any
 from datetime import datetime
-from crypto_utils import sha256, verify_signature
+from crypto_utils import sha256, verify_signature, sign_data
 from database import Database, Contact, Message
 
-# Константы DHT
-K = 20          # размер k-бакета
-ALPHA = 3       # параллелизм запросов
-REPLICATION = 3 # количество хранителей сообщения
+K = 20
+ALPHA = 3
+REPLICATION = 3
 
 def distance(a: bytes, b: bytes) -> int:
     return int.from_bytes(a, 'big') ^ int.from_bytes(b, 'big')
@@ -32,10 +28,11 @@ class P2PNode:
         self.public_key = public_key
         self.private_key = private_key
         self.db = db
+        self.username_hash = sha256(username.encode())
         self.running = False
         self.socket = None
-        self.peers: Dict[str, Tuple[str, int, float]] = {}  # node_id -> (ip, port, last_seen)
-        self.buckets = [ [] for _ in range(256) ]  # Kademlia routing table
+        self.peers: Dict[str, Tuple[str, int, float]] = {}
+        self.buckets = [ [] for _ in range(256) ]
         self.message_queue = queue.Queue()
         self.callbacks = []
         self.listener_thread = None
@@ -88,13 +85,9 @@ class P2PNode:
         except:
             pass
 
-    def _rpc_call(self, ip: str, port: int, request: dict, timeout=2) -> Optional[dict]:
-        # Простой RPC с ожиданием ответа (для краткости реализован через временный сокет)
-        # В реальном проекте нужно сделать асинхронно, но для простоты используем таймаут.
-        # В данном коде мы будем использовать асинхронный подход через колбэки, но для запросов, требующих ответа,
-        # можно реализовать примитивный вариант.
-        # Для упрощения, в методах FIND_NODE и FIND_VALUE используем асинхронную обработку.
-        pass
+    def _sign_contact_info(self) -> bytes:
+        data = self.username_hash + self.public_key + self.node_id
+        return sign_data(self.private_key, data)
 
     def _handle_message(self, data: bytes, addr: Tuple[str, int]):
         try:
@@ -127,36 +120,42 @@ class P2PNode:
         elif mtype == 'SYNC_CONTACTS_RESPONSE':
             self._handle_sync_contacts_response(msg, addr)
 
-    # ---------- Обработчики ----------
     def _handle_hello(self, msg, addr):
         node_id = bytes.fromhex(msg['node_id'])
         username = msg['username']
         peer_port = msg['port']
         pubkey = bytes.fromhex(msg.get('public_key', ''))
+        signature = bytes.fromhex(msg.get('signature', ''))
+
         if pubkey:
-            contact = Contact(
-                username=username,
-                username_hash=sha256(username.encode()),
-                public_key=pubkey,
-                node_id=node_id,
-                last_seen=time.time(),
-                last_ip=addr[0],
-                last_port=peer_port,
-                signature=bytes.fromhex(msg.get('signature', ''))
-            )
-            # Проверяем подпись
-            if verify_signature(pubkey, contact.signature, contact.username_hash + contact.public_key + contact.node_id):
+            username_hash = sha256(username.encode())
+            data_to_verify = username_hash + pubkey + node_id
+            if verify_signature(pubkey, signature, data_to_verify):
+                contact = Contact(
+                    username=username,
+                    username_hash=username_hash,
+                    public_key=pubkey,
+                    node_id=node_id,
+                    last_seen=time.time(),
+                    last_ip=addr[0],
+                    last_port=peer_port,
+                    signature=signature
+                )
                 self.db.save_contact(contact)
+                self.db.ensure_chat(username)
                 self._trigger_callbacks('contact_found', username)
+            else:
+                print(f"[WARN] Invalid signature in HELLO from {username}")
         self._add_peer(node_id, addr[0], peer_port)
-        # Ответ
+
+        sig = self._sign_contact_info().hex()
         resp = {
             'type': 'HELLO',
             'node_id': self.node_id.hex(),
             'username': self.username,
             'port': self.port,
             'public_key': self.public_key.hex(),
-            'signature': b''.hex()  # TODO: подписать
+            'signature': sig
         }
         self._send_to(addr[0], peer_port, json.dumps(resp).encode())
 
@@ -174,14 +173,11 @@ class P2PNode:
         self._send_to(addr[0], addr[1], json.dumps(resp).encode())
 
     def _handle_nodes(self, msg, addr):
-        # Обработка ответа FIND_NODE (в асинхронном стиле не реализовано для краткости)
         pass
 
     def _handle_find_value(self, msg, addr):
-        key = msg['key']  # username_hash
-        # Ищем в локальной базе контактов
+        key = msg['key']
         contact = None
-        # Можно искать по username_hash, но у нас нет индекса. Для примера пройдёмся.
         for c in self.db.get_all_contacts():
             if c.username_hash.hex() == key:
                 contact = c
@@ -197,7 +193,6 @@ class P2PNode:
             resp = {'type': 'VALUE', 'key': key, 'value': value}
             self._send_to(addr[0], addr[1], json.dumps(resp).encode())
         else:
-            # Возвращаем ближайших узлов
             closest = self._get_closest_nodes(bytes.fromhex(key), K)
             resp = {'type': 'NODES', 'nodes': [(ip, port) for _, (ip, port, _) in closest]}
             self._send_to(addr[0], addr[1], json.dumps(resp).encode())
@@ -205,26 +200,30 @@ class P2PNode:
     def _handle_value(self, msg, addr):
         key = msg['key']
         value = msg['value']
-        # Сохраняем контакт
-        contact = Contact(
-            username=value['username'],
-            username_hash=bytes.fromhex(key),
-            public_key=bytes.fromhex(value['public_key']),
-            node_id=bytes.fromhex(value['node_id']),
-            last_seen=value['last_seen'],
-            last_ip='',  # неизвестно
-            last_port=0,
-            signature=bytes.fromhex(value['signature'])
-        )
-        if verify_signature(contact.public_key, contact.signature,
-                            contact.username_hash + contact.public_key + contact.node_id):
+        pubkey = bytes.fromhex(value['public_key'])
+        node_id = bytes.fromhex(value['node_id'])
+        username_hash = bytes.fromhex(key)
+        sig = bytes.fromhex(value['signature'])
+        data_to_verify = username_hash + pubkey + node_id
+        if verify_signature(pubkey, sig, data_to_verify):
+            contact = Contact(
+                username=value['username'],
+                username_hash=username_hash,
+                public_key=pubkey,
+                node_id=node_id,
+                last_seen=value['last_seen'],
+                last_ip='',
+                last_port=0,
+                signature=sig
+            )
             self.db.save_contact(contact)
+            self.db.ensure_chat(contact.username)
             self._trigger_callbacks('contact_found', contact.username)
+        else:
+            print("[WARN] Invalid signature in VALUE")
 
     def _handle_store(self, msg, addr):
-        # Сохранение offline-сообщения
         recipient_node_id = bytes.fromhex(msg['recipient_node_id'])
-        # Проверяем, являемся ли мы одним из K ближайших к recipient_node_id
         if self._am_i_responsible(recipient_node_id):
             self.db.store_offline_message(
                 msg['msg_id'],
@@ -232,12 +231,10 @@ class P2PNode:
                 bytes.fromhex(msg['encrypted_blob']),
                 msg['timestamp']
             )
-            # Реплицируем на других ближайших
             self._replicate_message(msg)
 
     def _handle_retrieve_messages(self, msg, addr):
         requester_node_id = bytes.fromhex(msg['node_id'])
-        # Отдаём все сообщения для этого получателя
         msgs = self.db.get_offline_messages(requester_node_id)
         for msg_id, blob in msgs:
             resp = {
@@ -248,10 +245,6 @@ class P2PNode:
             self._send_to(addr[0], addr[1], json.dumps(resp).encode())
 
     def _handle_message_receive(self, msg, addr):
-        # Это либо прямое сообщение, либо доставленное из offline-хранилища
-        # Пытаемся расшифровать и сохранить
-        # ... (расшифровка с использованием приватного ключа)
-        # Упростим: будем считать, что сообщение приходит уже в расшифрованном виде
         if 'content' in msg:
             message = Message(
                 msg_id=msg['msg_id'],
@@ -263,14 +256,10 @@ class P2PNode:
             )
             self.db.save_message(message)
             self._trigger_callbacks('message', message)
-        # Если это зашифрованный блоб, пытаемся расшифровать
         elif 'encrypted_blob' in msg:
-            # Расшифровка с использованием приватного ключа получателя (ECIES)
-            # Для простоты пропустим
             pass
 
     def _handle_sync_contacts_request(self, msg, addr):
-        # Отправляем хеш-сумму нашей таблицы контактов
         contacts = self.db.get_all_contacts()
         data = b''.join(c.username_hash + c.public_key + c.node_id for c in contacts)
         hash_sum = sha256(data).hex()
@@ -278,11 +267,8 @@ class P2PNode:
         self._send_to(addr[0], addr[1], json.dumps(resp).encode())
 
     def _handle_sync_contacts_response(self, msg, addr):
-        # Сравниваем с локальной хеш-суммой
-        # Если отличаются, запрашиваем полный список у этого пира
         pass
 
-    # ---------- Вспомогательные методы DHT ----------
     def _get_bucket_index(self, node_id: bytes) -> int:
         dist = distance(self.node_id, node_id)
         if dist == 0:
@@ -292,19 +278,16 @@ class P2PNode:
     def _add_peer(self, node_id: bytes, ip: str, port: int):
         idx = self._get_bucket_index(node_id)
         bucket = self.buckets[idx]
-        # Проверить, есть ли уже
         for nid, (_, _, _) in bucket:
             if nid == node_id:
                 return
         if len(bucket) < K:
             bucket.append((node_id, (ip, port, time.time())))
         else:
-            # Пинговать первый узел, если не отвечает - заменить
             pass
         self.peers[node_id.hex()] = (ip, port, time.time())
 
     def _get_closest_nodes(self, target: bytes, count: int) -> List[Tuple[bytes, Tuple[str, int, float]]]:
-        # Собрать всех известных пиров
         all_nodes = []
         for bucket in self.buckets:
             all_nodes.extend(bucket)
@@ -321,8 +304,7 @@ class P2PNode:
 
     def _replicate_message(self, store_msg: dict):
         recipient_id = bytes.fromhex(store_msg['recipient_node_id'])
-        closest = self._get_closest_nodes(recipient_id, REPLICATION + 1)  # +1 включая себя
-        # Отправляем STORE ближайшим, кроме себя
+        closest = self._get_closest_nodes(recipient_id, REPLICATION + 1)
         for nid, (ip, port, _) in closest:
             if nid == self.node_id:
                 continue
@@ -331,11 +313,9 @@ class P2PNode:
     def _stabilize_loop(self):
         while self.running:
             time.sleep(30)
-            # Удаляем старых пиров, обновляем бакеты, запрашиваем offline-сообщения
             self._retrieve_offline_messages()
 
     def _retrieve_offline_messages(self):
-        # Запрашиваем у ближайших узлов сообщения для нас
         closest = self._get_closest_nodes(self.node_id, REPLICATION)
         req = {'type': 'RETRIEVE_MESSAGES', 'node_id': self.node_id.hex()}
         for nid, (ip, port, _) in closest:
@@ -343,22 +323,20 @@ class P2PNode:
                 continue
             self._send_to(ip, port, json.dumps(req).encode())
 
-    # ---------- Публичные методы ----------
     def connect_to_peer(self, ip: str, port: int):
+        sig = self._sign_contact_info().hex()
         hello = {
             'type': 'HELLO',
             'node_id': self.node_id.hex(),
             'username': self.username,
             'port': self.port,
             'public_key': self.public_key.hex(),
-            'signature': b''.hex()  # TODO
+            'signature': sig
         }
         self._send_to(ip, port, json.dumps(hello).encode())
 
     def find_user(self, username: str):
         target = sha256(username.encode()).hex()
-        # Запускаем итеративный поиск (FindValue)
-        # Для простоты сделаем запрос всем известным пирам
         req = {'type': 'FIND_VALUE', 'key': target}
         for ip, port, _ in self.peers.values():
             self._send_to(ip, port, json.dumps(req).encode())
@@ -367,7 +345,6 @@ class P2PNode:
         contact = self.db.get_contact(recipient)
         if not contact:
             return False
-        # Формируем сообщение
         msg_id = sha256(f"{self.username}{recipient}{content}{time.time()}".encode()).hex()[:16]
         msg = {
             'type': 'MESSAGE',
@@ -376,15 +353,12 @@ class P2PNode:
             'recipient': recipient,
             'content': content,
             'timestamp': time.time(),
-            'signature': b''.hex()  # TODO
+            'signature': b''.hex()
         }
-        # Если контакт онлайн, отправляем напрямую
-        if time.time() - contact.last_seen < 300:
+        if contact.last_ip and (time.time() - contact.last_seen) < 300:
             self._send_to(contact.last_ip, contact.last_port, json.dumps(msg).encode())
         else:
-            # Offline: сохраняем у ближайших узлов
             self._store_offline_message(contact.node_id, msg)
-        # Сохраняем у себя
         message = Message(
             msg_id=msg_id,
             sender_username=self.username,
@@ -398,8 +372,7 @@ class P2PNode:
         return True
 
     def _store_offline_message(self, recipient_node_id: bytes, msg: dict):
-        # Шифруем сообщение публичным ключом получателя (упростим - не шифруем для демо)
-        encrypted_blob = json.dumps(msg).encode()  # В реальности ECIES
+        encrypted_blob = json.dumps(msg).encode()
         store_msg = {
             'type': 'STORE',
             'msg_id': msg['msg_id'],
