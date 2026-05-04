@@ -1,0 +1,13 @@
+# Cryptography
+cryptography>=41.0.0
+
+# Tkinter — встроен в Python на Windows/macOS.
+# На Linux может потребоваться установить системный пакет:
+# sudo apt install python3-tk   (Debian/Ubuntu)
+# sudo pacman -S tk             (Arch/Manjaro)
+# В requirements.txt не указывается, так как не ставится через pip.
+
+# Стандартная библиотека используется для:
+# os, sys, json, socket, threading, time, queue, random, math,
+# typing, dataclasses, datetime, hashlib, secrets, urllib.request, argparse
+# Их pip устанавливать не нужно.
